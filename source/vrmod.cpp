@@ -19,6 +19,10 @@
 #include <unistd.h>
 #endif
 
+#include "detouring/classproxy.hpp"
+#include "GarrysMod/FactoryLoader.hpp"
+#include "materialsystem/imaterialsystem.h"
+
 static constexpr int MAX_STR_LEN = 256;
 static constexpr int MAX_ACTIONS = 64;
 static constexpr int MAX_ACTIONSETS = 16;
@@ -563,27 +567,6 @@ LUA_FUNCTION_STATIC(SetSubmitTextureBounds)
 	return 0;
 }
 
-LUA_FUNCTION_STATIC(SubmitSharedTexture)
-{
-#ifdef _WIN32
-	if (g_d3d11Texture == NULL)
-		return 0;
-
-	IDirect3DQuery9* pEventQuery = nullptr;
-	g_pD3D9Device->CreateQuery(D3DQUERYTYPE_EVENT, &pEventQuery);
-	if (pEventQuery != nullptr)
-	{
-		pEventQuery->Issue(D3DISSUE_END);
-		while (pEventQuery->GetData(nullptr, 0, D3DGETDATA_FLUSH) != S_OK);
-		pEventQuery->Release();
-	}
-#endif
-
-	vr::VRCompositor()->Submit(vr::EVREye::Eye_Left, &g_vrTexture, &g_textureBoundsLeft);
-	vr::VRCompositor()->Submit(vr::EVREye::Eye_Right, &g_vrTexture, &g_textureBoundsRight);
-	return 0;
-}
-
 LUA_FUNCTION_STATIC(Shutdown)
 {
 	if (g_pSystem != NULL)
@@ -652,6 +635,84 @@ LUA_FUNCTION_STATIC(GetTrackedDeviceNames)
 	return 1;
 }
 
+static void SubmitVRFrame()
+{
+#ifdef _WIN32
+	if (g_d3d11Texture == NULL)
+		return;
+
+	IDirect3DQuery9* pEventQuery = nullptr;
+	g_pD3D9Device->CreateQuery(D3DQUERYTYPE_EVENT, &pEventQuery);
+	if (pEventQuery != nullptr)
+	{
+		pEventQuery->Issue(D3DISSUE_END);
+		while (pEventQuery->GetData(nullptr, 0, D3DGETDATA_FLUSH) != S_OK);
+		pEventQuery->Release();
+	}
+#endif
+
+	vr::VRCompositor()->Submit(vr::EVREye::Eye_Left, &g_vrTexture, &g_textureBoundsLeft);
+	vr::VRCompositor()->Submit(vr::EVREye::Eye_Right, &g_vrTexture, &g_textureBoundsRight);
+}
+
+static bool g_bSupportsMCore = false;
+class CMaterialSystemProxy : public Detouring::ClassProxy<IMaterialSystem, CMaterialSystemProxy>
+{
+public:
+	CMaterialSystemProxy(IMaterialSystem* materialSystem)
+	{
+		if (!Initialize(materialSystem))
+		{
+			Warning("vrmod: Failed to initialize into CMaterialSystem! mcore will be broken!\n");
+			return;
+		}
+
+		if (!Hook(&IMaterialSystem::EndFrame, &CMaterialSystemProxy::EndFrame))
+		{
+			Warning("vrmod: Failed to hook into CMaterialSystem::EndFrame! mcore will be broken!\n");
+		} else
+		{
+			g_bSupportsMCore = true;
+		}
+	}
+
+	void DeInit()
+	{
+		UnHook(&IMaterialSystem::EndFrame);
+		g_bSupportsMCore = false;
+	}
+
+	virtual void EndFrame()
+	{
+		Call(&IMaterialSystem::EndFrame);
+		
+		// RaphaelIT7:
+		// We lock & unlock here, as in some weird rare cases something can STILL be running, like once a minute it flickers black.
+		// But locking here at the end is way better, as doing it sooner would've given it less time to render.
+		MaterialLock_t pLock = This()->Lock();
+		
+		SubmitVRFrame();
+
+		This()->Unlock(pLock);
+	}
+};
+
+LUA_FUNCTION_STATIC(SupportsMCore)
+{
+	LUA->PushBool(g_bSupportsMCore);
+	return 1;
+}
+
+LUA_FUNCTION_STATIC(SubmitSharedTexture)
+{
+	if (g_bSupportsMCore)
+		return 0;
+
+	SubmitVRFrame();
+	return 0;
+}
+
+static CMaterialSystemProxy* g_pMaterialSystemProxy = nullptr;
 GMOD_MODULE_OPEN()
 {
 	Util::StartTable(LUA);
@@ -671,11 +732,30 @@ GMOD_MODULE_OPEN()
 		Util::AddFunc(LUA, Shutdown, "Shutdown");
 		Util::AddFunc(LUA, TriggerHaptic, "TriggerHaptic");
 		Util::AddFunc(LUA, GetTrackedDeviceNames, "GetTrackedDeviceNames");
+		Util::AddFunc(LUA, SupportsMCore, "SupportsMCore");
 	Util::FinishTable(LUA, "vrmod");
+
+	if (!g_pMaterialSystemProxy)
+	{
+		SourceSDK::FactoryLoader materialsystem_loader("materialsystem");
+		IMaterialSystem* materialSystem = materialsystem_loader.GetInterface<IMaterialSystem>(MATERIAL_SYSTEM_INTERFACE_VERSION);
+		if (materialSystem)
+			g_pMaterialSystemProxy = new CMaterialSystemProxy(materialSystem);
+		else
+			Warning("vrmod: Failed to load IMaterialSystem! mcore will be broken!\n");
+	}
 
 	return 0;
 }
 
-GMOD_MODULE_CLOSE(){
+GMOD_MODULE_CLOSE()
+{
+	if (g_pMaterialSystemProxy)
+	{
+		g_pMaterialSystemProxy->DeInit();
+		delete g_pMaterialSystemProxy;
+		g_pMaterialSystemProxy = nullptr;
+	}
+
 	return 0;
 }

@@ -6,14 +6,19 @@ CreateClientConVar("cardboardmod_sensitivity", "0.01", true, false)
 local ogMcore, ogBorder, ogVMFOV
 
 concommand.Add( "cardboardmod_start", function( ply, cmd, args )
-	ogMcore = GetConVar("gmod_mcore_test"):GetString()
+	if not VRMOD_SupportsMCore() then
+		ogMcore = GetConVar("gmod_mcore_test"):GetString()
+	end
+	
 	if g_SpawnMenu then
 		ogBorder = GetConVar("spawnmenu_border"):GetString()
 		RunConsoleCommand("spawnmenu_border", "0")
 	end
 	ogVMFOV = GetConVar("viewmodel_fov"):GetString()
-
-	RunConsoleCommand("gmod_mcore_test", "0")
+	
+	if not VRMOD_SupportsMCore() then
+		RunConsoleCommand("gmod_mcore_test", "0")
+	end
 	RunConsoleCommand("viewmodel_fov", "90")
 	
 	if VRMOD_GetVersion() >= 12 then
@@ -201,7 +206,10 @@ concommand.Add( "cardboardmod_exit", function( ply, cmd, args )
 		hook.Remove("CreateMove","cardboardmod_createmove")
 	end)
 	
-	RunConsoleCommand("gmod_mcore_test", ogMcore)
+	if not VRMOD_SupportsMCore() then
+		RunConsoleCommand("gmod_mcore_test", ogMcore)
+	end
+	
 	if g_SpawnMenu then
 		RunConsoleCommand("spawnmenu_border", ogBorder)
 	end
