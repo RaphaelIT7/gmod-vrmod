@@ -23,3 +23,55 @@ jobs:
       SOURCESDK_MINIMAL_BRANCH: "patch-6"
       SOURCESDK_MINIMAL_64XBRANCH: "x86-64-patch-2"
       GARRYSMOD_COMMON: "RaphaelIT7/garrysmod_common"
+
+  setup_artifact:
+    name: "Create install zips"
+    needs: build_module
+    runs-on: ubuntu-latest
+    container: debian:bullseye
+    strategy:
+      matrix:
+        builds:
+          - module: gmcl_vrmod_linux.dll
+            bin: bins/linux32/
+            gmod_bin: garrysmod/bin/
+          - module: gmcl_vrmod_linux64.dll (64x)
+            bin: bins/linux64/
+            gmod_bin: garrysmod/bin/linux64/
+          - module: gmcl_vrmod_win32.dll
+            bin: bins/win32/
+            gmod_bin: garrysmod/bin/
+          - module: gmcl_vrmod_win64.dll
+            bin: bins/win64/
+            gmod_bin: garrysmod/bin/win64/
+    steps:
+      - uses: actions/checkout@v4
+        name: "Checkout bin files"
+        with:
+          sparse-checkout: |
+            ${{ matrix.bin }}
+            bins/openvr_license
+
+      - uses: actions/download-artifact@v4
+        name: "Download module"
+        with:
+          name: ${{ matrix.module }}
+
+      - name: "Create install"
+        run: |
+          mkdir -p garrysmod/lua/bin
+          mkdir -p ${{ matrix.gmod_bin }}
+          mv ${{ matrix.module }} garrysmod/lua/bin/
+          mv ${{ matrix.bin }}/*.* ${{ matrix.gmod_bin }}
+          mv bins/openvr_license ${{ matrix.gmod_bin }}
+
+          apt-get update && apt-get install -y zip
+          zip -r install.zip garrysmod/
+
+      - uses: actions/upload-artifact@v4
+        name: "Upload zip"
+        with:
+          name: ${{ matrix.module }} (install)
+          path: install.zip
+          compression-level: 9
+          retention-days: 7

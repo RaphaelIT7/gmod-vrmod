@@ -25,7 +25,7 @@ CreateWorkspace({name = "vrmod", abi_compatible = false})
 	-- Can define "manual_files", which allows you to manually add files to the project,
 	-- instead of automatically including them from the "source_path"
 	-- Can also define "abi_compatible", for project specific compatibility
-	CreateProject({serverside = false, manual_files = false})
+	CreateProject({serverside = false, manual_files = false, source_path = sourcePath:sub(0, -2)})
 		symbols "On"
 		-- Remove some or all of these includes if they're not needed
 		IncludeHelpersExtended()
@@ -46,11 +46,33 @@ CreateWorkspace({name = "vrmod", abi_compatible = false})
 		defines("PROJECT_NAME=\"vrmod\"")
 
 		files({
+			sourcePath .. "openvr/*.h",
 			rootDir .. "README.md",
 			rootDir .. ".github/workflows/**.yml",
 		})
 
 		vpaths({
+			["OpenVR"] = sourcePath .. "openvr/*.h",
 			["README"] = rootDir .. "README.md",
 			["Workflows"] = rootDir .. ".github/workflows/**.yml",
 		})
+
+		links("openvr_api")
+		filter("system:windows")
+			links("D3D11")
+
+		filter("system:windows", "platforms:x86")
+			libdirs(rootDir .. "libs/win32")
+
+		filter("system:windows", "platforms:x86_64")
+			libdirs(rootDir .. "libs/win64")
+
+		filter({"system:linux", "platforms:x86_64"})
+			libdirs(rootDir .. "libs/linux64")
+			buildoptions({"-mcx16"})
+
+		filter({"system:linux", "platforms:x86"})
+			libdirs(rootDir .. "libs/linux32")
+
+		filter({"platforms:x86_64"})
+			defines("PLATFORM_64BITS")
