@@ -1,4 +1,4 @@
-#include "GarrysMod/Lua/Interface.h"
+#include "util.h"
 #include <openvr/openvr.h>
 #include <stdio.h>
 #include <string.h>
@@ -197,7 +197,8 @@ LUA_FUNCTION_STATIC(Init)
 	return 0;
 }
 
-LUA_FUNCTION_STATIC(SetActionManifest) {
+LUA_FUNCTION_STATIC(SetActionManifest)
+{
 	const char* fileName = LUA->CheckString(1);
 	char path[PATH_MAX];
 	char currentDir[PATH_MAX];
@@ -219,10 +220,12 @@ LUA_FUNCTION_STATIC(SetActionManifest) {
 		LUA->ThrowError("failed to open action manifest");
 
 	memset(g_actions, 0, sizeof(g_actions));
+
 	char word[MAX_STR_LEN];
 	char fmt1[MAX_STR_LEN], fmt2[MAX_STR_LEN];
 	snprintf(fmt1, MAX_STR_LEN, "%%*[^\"]\"%%%i[^\"]\"", MAX_STR_LEN-1);
 	snprintf(fmt2, MAX_STR_LEN, "%%%i[^\"]\"", MAX_STR_LEN-1);
+
 	while (fscanf(file, fmt1, word) == 1 && strcmp(word, "actions") != 0);
 	while (fscanf(file, fmt2, word) == 1)
 	{
@@ -235,7 +238,8 @@ LUA_FUNCTION_STATIC(SetActionManifest) {
 				break;
 
 			g_actions[g_actionCount].name = g_actions[g_actionCount].fullname;
-			for (unsigned int i = 0; i < strlen(g_actions[g_actionCount].fullname); i++) {
+			for (unsigned int i = 0; i < strlen(g_actions[g_actionCount].fullname); i++)
+			{
 				if (g_actions[g_actionCount].fullname[i] == '/')
 					g_actions[g_actionCount].name = g_actions[g_actionCount].fullname + i + 1;
 			}
@@ -270,15 +274,17 @@ LUA_FUNCTION_STATIC(SetActionManifest) {
 	return 0;
 }
 
-LUA_FUNCTION_STATIC(SetActiveActionSets) {
+LUA_FUNCTION_STATIC(SetActiveActionSets)
+{
 	g_activeActionSetCount = 0;
 	for (int i = 0; i < MAX_ACTIONSETS; i++)
 	{
 		if (LUA->GetType(i + 1) == GarrysMod::Lua::Type::STRING)
 		{
-			const char* actionSetName = LUA->CheckString(i + 1);
+			const char* actionSetName = LUA->GetString(i + 1);
 			int actionSetIndex = -1;
-			for (int j = 0; j < g_actionSetCount; j++) {
+			for (int j = 0; j < g_actionSetCount; j++)
+			{
 				if (strcmp(actionSetName, g_actionSets[j].name) == 0)
 				{
 					actionSetIndex = j;
@@ -302,22 +308,21 @@ LUA_FUNCTION_STATIC(SetActiveActionSets) {
 	return 0;
 }
 
-void PushMatrixAsTable(GarrysMod::Lua::ILuaBase* LUA, float* mtx, unsigned int rows, unsigned int cols)
+void PushMatrixAsTable(GarrysMod::Lua::ILuaInterface* LUA, float* mtx, unsigned int rows, unsigned int cols)
 {
-	LUA->CreateTable();
 	LUA->PreCreateTable(rows, 0);
 	for (unsigned int row = 0; row < rows; row++)
 	{
 		LUA->PushNumber(row + 1);
-		LUA->CreateTable();
+		LUA->PreCreateTable(cols, 0);
 		for (unsigned int col = 0; col < cols; col++)
 		{
 			LUA->PushNumber(col+1);
 			LUA->PushNumber(mtx[row * cols + col]);
-			LUA->SetTable(-3);
+			LUA->RawSet(-3);
 		}
 
-		LUA->SetTable(-3);
+		LUA->RawSet(-3);
 	}
 }
 
@@ -333,7 +338,7 @@ LUA_FUNCTION_STATIC(GetDisplayInfo)
 	vr::HmdMatrix34_t transformLeft = g_pSystem->GetEyeToHeadTransform(vr::Eye_Left);
 	vr::HmdMatrix34_t transformRight = g_pSystem->GetEyeToHeadTransform(vr::Eye_Right);
 
-	LUA->CreateTable();
+	LUA->PreCreateTable(0, 6);
 		PushMatrixAsTable(LUA, (float*)&projLeft, 4, 4);
 		LUA->SetField(-2, "ProjectionLeft");
 
@@ -466,7 +471,7 @@ LUA_FUNCTION_STATIC(GetActions)
 				{
 					LUA->PushNumber(j + 1);
 					LUA->PushNumber(skeletalSummaryData.flFingerCurl[j]);
-					LUA->SetTable(-3);
+					LUA->RawSet(-3);
 				}
 				LUA->SetField(-2, "fingerCurls");
 			LUA->SetField(-2, g_actions[i].name);
@@ -478,7 +483,7 @@ LUA_FUNCTION_STATIC(GetActions)
 		LUA->ReferencePush(g_luaRefs[LuaRefIndex_EmptyTable]);
 	} else
 	{
-		LUA->CreateTable();
+		LUA->PreCreateTable(0, changedActionCount);
 		for (int i = 0; i < changedActionCount; i++)
 		{
 			LUA->PushBool(changedActionStates[i]);
@@ -638,75 +643,36 @@ LUA_FUNCTION_STATIC(GetTrackedDeviceNames)
 	{
 		if (g_pSystem->GetStringTrackedDeviceProperty(i, vr::Prop_ControllerType_String, name, MAX_STR_LEN) > 1)
 		{
-			LUA->PushNumber(tableIndex);
+			LUA->PushNumber(tableIndex++);
 			LUA->PushString(name);
-			LUA->SetTable(-3);
-			tableIndex++;
+			LUA->RawSet(-3);
 		}
 	}
 
 	return 1;
 }
 
-	LUA->PushSpecial(GarrysMod::Lua::SPECIAL_GLOB);
-	LUA->GetField(-1, "vrmod");
-	if (!LUA->IsType(-1, GarrysMod::Lua::Type::TABLE))
-	{
-		LUA->Pop(1);
-		LUA->CreateTable();
-	}
 GMOD_MODULE_OPEN()
 {
+	Util::StartTable(LUA);
+		Util::AddFunc(LUA, GetVersion, "GetVersion");
+		Util::AddFunc(LUA, IsHMDPresent, "IsHMDPresent");
+		Util::AddFunc(LUA, Init, "Init");
+		Util::AddFunc(LUA, SetActionManifest, "SetActionManifest");
+		Util::AddFunc(LUA, SetActiveActionSets, "SetActiveActionSets");
+		Util::AddFunc(LUA, GetDisplayInfo, "GetDisplayInfo");
+		Util::AddFunc(LUA, UpdatePosesAndActions, "UpdatePosesAndActions");
+		Util::AddFunc(LUA, GetPoses, "GetPoses");
+		Util::AddFunc(LUA, GetActions, "GetActions");
+		Util::AddFunc(LUA, ShareTextureBegin, "ShareTextureBegin");
+		Util::AddFunc(LUA, ShareTextureFinish, "ShareTextureFinish");
+		Util::AddFunc(LUA, SetSubmitTextureBounds, "SetSubmitTextureBounds");
+		Util::AddFunc(LUA, SubmitSharedTexture, "SubmitSharedTexture");
+		Util::AddFunc(LUA, Shutdown, "Shutdown");
+		Util::AddFunc(LUA, TriggerHaptic, "TriggerHaptic");
+		Util::AddFunc(LUA, GetTrackedDeviceNames, "GetTrackedDeviceNames");
+	Util::FinishTable(LUA, "vrmod");
 
-	LUA->PushCFunction(GetVersion);
-	LUA->SetField(-2, "GetVersion");
-
-	LUA->PushCFunction(IsHMDPresent);
-	LUA->SetField(-2, "IsHMDPresent");
-
-	LUA->PushCFunction(Init);
-	LUA->SetField(-2, "Init");
-
-	LUA->PushCFunction(SetActionManifest);
-	LUA->SetField(-2, "SetActionManifest");
-
-	LUA->PushCFunction(SetActiveActionSets);
-	LUA->SetField(-2, "SetActiveActionSets");
-
-	LUA->PushCFunction(GetDisplayInfo);
-	LUA->SetField(-2, "GetDisplayInfo");
-
-	LUA->PushCFunction(UpdatePosesAndActions);
-	LUA->SetField(-2, "UpdatePosesAndActions");
-
-	LUA->PushCFunction(GetPoses);
-	LUA->SetField(-2, "GetPoses");
-
-	LUA->PushCFunction(GetActions);
-	LUA->SetField(-2, "GetActions");
-
-	LUA->PushCFunction(ShareTextureBegin);
-	LUA->SetField(-2, "ShareTextureBegin");
-
-	LUA->PushCFunction(ShareTextureFinish);
-	LUA->SetField(-2, "ShareTextureFinish");
-
-	LUA->PushCFunction(SetSubmitTextureBounds);
-	LUA->SetField(-2, "SetSubmitTextureBounds");
-
-	LUA->PushCFunction(SubmitSharedTexture);
-	LUA->SetField(-2, "SubmitSharedTexture");
-
-	LUA->PushCFunction(Shutdown);
-	LUA->SetField(-2, "Shutdown");
-
-	LUA->PushCFunction(TriggerHaptic);
-	LUA->SetField(-2, "TriggerHaptic");
-
-	LUA->PushCFunction(GetTrackedDeviceNames);
-	LUA->SetField(-2, "GetTrackedDeviceNames");
-
-	LUA->SetField(-2, "vrmod");
 	return 0;
 }
 
