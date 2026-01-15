@@ -1,0 +1,25 @@
+name: Build Module
+
+on: 
+  push:
+    paths:
+      - '.github/workflows/compile.yml'
+      - 'source/**'
+      - 'premake5.lua'
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build_module:
+    name: "Build Module"
+    uses: RaphaelIT7/gmod-common-module-base/.github/workflows/compile.yml@workflow
+    with:
+      PROJECT_NAME: "vrmod"
+      BUILD_64x: "true"
+      BUILD_WINDOWS: "true"
+      REALM: "cl"
+      ARTIFACT_EXPIRE: "7"
+      SOURCESDK_MINIMAL: "RaphaelIT7/sourcesdk-minimal"
+      SOURCESDK_MINIMAL_BRANCH: "patch-6"
+      SOURCESDK_MINIMAL_64XBRANCH: "x86-64-patch-2"
+      GARRYSMOD_COMMON: "RaphaelIT7/garrysmod_common"
