@@ -17,6 +17,7 @@ jobs:
       PROJECT_NAME: "vrmod"
       BUILD_64x: "true"
       BUILD_WINDOWS: "true"
+      BUILD_LINUX: "false"
       REALM: "cl"
       ARTIFACT_EXPIRE: "7"
       SOURCESDK_MINIMAL: "RaphaelIT7/sourcesdk-minimal"
@@ -31,19 +32,23 @@ jobs:
     container: debian:bullseye
     strategy:
       matrix:
-        builds:
-          - module: gmcl_vrmod_linux.dll
-            bin: bins/linux32/
-            gmod_bin: garrysmod/bin/
-          - module: gmcl_vrmod_linux64.dll (64x)
-            bin: bins/linux64/
-            gmod_bin: garrysmod/bin/linux64/
+        include:
           - module: gmcl_vrmod_win32.dll
+            artifact: gmcl_vrmod_win32.dll
             bin: bins/win32/
             gmod_bin: garrysmod/bin/
           - module: gmcl_vrmod_win64.dll
+            artifact: gmcl_vrmod_win64.dll (64x)
             bin: bins/win64/
             gmod_bin: garrysmod/bin/win64/
+          #- module: gmcl_vrmod_linux.dll
+          #  artifact: gmcl_vrmod_linux.dll
+          #  bin: bins/linux32/
+          #  gmod_bin: garrysmod/bin/
+          #- module: gmcl_vrmod_linux64.dll
+          #  artifact: gmcl_vrmod_linux64.dll (64x)
+          #  bin: bins/linux64/
+          #  gmod_bin: garrysmod/bin/linux64/
     steps:
       - uses: actions/checkout@v4
         name: "Checkout bin files"
@@ -55,14 +60,14 @@ jobs:
       - uses: actions/download-artifact@v4
         name: "Download module"
         with:
-          name: ${{ matrix.module }}
+          name: ${{ matrix.artifact }}
 
       - name: "Create install"
         run: |
           mkdir -p garrysmod/lua/bin
           mkdir -p ${{ matrix.gmod_bin }}
           mv ${{ matrix.module }} garrysmod/lua/bin/
-          mv ${{ matrix.bin }}/*.* ${{ matrix.gmod_bin }}
+          mv ${{ matrix.bin }}*.* ${{ matrix.gmod_bin }}
           mv bins/openvr_license ${{ matrix.gmod_bin }}
 
           apt-get update && apt-get install -y zip

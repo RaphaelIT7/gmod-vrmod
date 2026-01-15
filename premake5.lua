@@ -57,22 +57,25 @@ CreateWorkspace({name = "vrmod", abi_compatible = false})
 			["Workflows"] = rootDir .. ".github/workflows/**.yml",
 		})
 
-		links("openvr_api")
 		filter("system:windows")
 			links("D3D11")
 
 		filter("system:windows", "platforms:x86")
 			libdirs(rootDir .. "libs/win32")
+			links("openvr_api_32")
 
 		filter("system:windows", "platforms:x86_64")
 			libdirs(rootDir .. "libs/win64")
+			links("openvr_api_64")
 
 		filter({"system:linux", "platforms:x86_64"})
 			libdirs(rootDir .. "libs/linux64")
 			buildoptions({"-mcx16"})
+			links("openvr_api")
 
 		filter({"system:linux", "platforms:x86"})
 			libdirs(rootDir .. "libs/linux32")
+			links("openvr_api")
 
 		filter({"platforms:x86_64"})
 			defines("PLATFORM_64BITS")
