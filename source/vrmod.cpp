@@ -19,6 +19,8 @@
 #include <unistd.h>
 #endif
 
+#include "detours.h"
+#include "symbols.h"
 #include "detouring/classproxy.hpp"
 #include "GarrysMod/FactoryLoader.hpp"
 #include "materialsystem/imaterialsystem.h"
@@ -656,6 +658,8 @@ static void SubmitVRFrame()
 }
 
 static bool g_bSupportsMCore = false;
+static IMaterialSystem* g_pMaterialSystem = nullptr;
+static Detouring::Hook detour_CMatQueuedRenderContext_CallQueued;
 class CMaterialSystemProxy : public Detouring::ClassProxy<IMaterialSystem, CMaterialSystemProxy>
 {
 public:
@@ -686,14 +690,8 @@ public:
 	{
 		Call(&IMaterialSystem::EndFrame);
 		
-		// RaphaelIT7:
-		// We lock & unlock here, as in some weird rare cases something can STILL be running, like once a minute it flickers black.
-		// But locking here at the end is way better, as doing it sooner would've given it less time to render.
-		MaterialLock_t pLock = This()->Lock();
-		
-		SubmitVRFrame();
-
-		This()->Unlock(pLock);
+		if (!detour_CMatQueuedRenderContext_CallQueued.IsValid() || This()->GetThreadMode() == MaterialThreadMode_t::MATERIAL_SINGLE_THREADED)
+			SubmitVRFrame();
 	}
 };
 
@@ -711,6 +709,20 @@ LUA_FUNCTION_STATIC(SubmitSharedTexture)
 	SubmitVRFrame();
 	return 0;
 }
+
+static void hook_CMatQueuedRenderContext_CallQueued(IMatRenderContext* context, bool bTermAfterCall)
+{
+	detour_CMatQueuedRenderContext_CallQueued.GetTrampoline<Symbols::CMatQueuedRenderContext_CallQueued>()(context, bTermAfterCall);
+
+	if (g_pMaterialSystem->GetThreadMode() != MaterialThreadMode_t::MATERIAL_SINGLE_THREADED)
+		SubmitVRFrame();
+}
+
+#if SYSTEM_WINDOWS
+DETOUR_THISCALL_START()
+	DETOUR_THISCALL_ADDFUNC1( hook_CMatQueuedRenderContext_CallQueued, CallQueued, IMatRenderContext*, bool);
+DETOUR_THISCALL_FINISH();
+#endif
 
 static CMaterialSystemProxy* g_pMaterialSystemProxy = nullptr;
 GMOD_MODULE_OPEN()
@@ -735,15 +747,23 @@ GMOD_MODULE_OPEN()
 		Util::AddFunc(LUA, SupportsMCore, "SupportsMCore");
 	Util::FinishTable(LUA, "vrmod");
 
+	SourceSDK::FactoryLoader materialsystem_loader("materialsystem");
 	if (!g_pMaterialSystemProxy)
 	{
-		SourceSDK::FactoryLoader materialsystem_loader("materialsystem");
 		IMaterialSystem* materialSystem = materialsystem_loader.GetInterface<IMaterialSystem>(MATERIAL_SYSTEM_INTERFACE_VERSION);
-		if (materialSystem)
+		if (materialSystem) {
+			g_pMaterialSystem = materialSystem;
 			g_pMaterialSystemProxy = new CMaterialSystemProxy(materialSystem);
-		else
+		} else
 			Warning("vrmod: Failed to load IMaterialSystem! mcore will be broken!\n");
 	}
+
+	DETOUR_PREPARE_THISCALL();
+	Detour::Create(
+		&detour_CMatQueuedRenderContext_CallQueued, "CMatQueuedRenderContext::CallQueued",
+		materialsystem_loader.GetModule(), Symbols::CMatQueuedRenderContext_CallQueuedSym,
+		(void*)DETOUR_THISCALL(hook_CMatQueuedRenderContext_CallQueued, CallQueued), 0
+	);
 
 	return 0;
 }
@@ -756,6 +776,8 @@ GMOD_MODULE_CLOSE()
 		delete g_pMaterialSystemProxy;
 		g_pMaterialSystemProxy = nullptr;
 	}
+
+	Detour::Remove(0);
 
 	return 0;
 }

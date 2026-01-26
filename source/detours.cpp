@@ -1,0 +1,169 @@
+#include "detours.h"
+#include <convar.h>
+#include <unordered_map>
+#include <unordered_set>
+#include "tier0/dbg.h"
+
+// memdbgon must be the last include file in a .cpp file!!!
+#include "tier0/memdbgon.h"
+
+#ifndef PROJECT_NAME // When people copy this file they might not have it defined, so we just fallback.
+#define PROJECT_NAME "project"
+#endif
+
+SymbolFinder Detour::symfinder;
+void* Detour::GetFunction(void* pModule, Symbol pSymbol)
+{
+	// We don't ensure safety as if pModule is nullptr we should have checked before calling, else debugging gets painful
+	// if (!pModule)
+	//	return nullptr;
+
+	return symfinder.Resolve(pModule, pSymbol.name.c_str(), pSymbol.length);
+}
+
+
+struct DetourEntry
+{
+	DetourEntry() : detourName(""), nCategory(0), pHookFunc(nullptr), pTargetFunc(nullptr) {}
+
+	DetourEntry(std::string name, unsigned int category, void* hookFunc, void* targetFunc)
+	{
+		detourName = name;
+		nCategory = category;
+		pHookFunc = hookFunc;
+		pTargetFunc = targetFunc;
+	}
+
+	std::string detourName;
+	unsigned int nCategory;
+	void* pHookFunc;
+	void* pTargetFunc;
+};
+
+static std::unordered_set<std::string> pDisabledDetours;
+static std::unordered_set<std::string> pFailedDetours;
+static std::unordered_map<std::string, unsigned int> pLoadedDetours;
+static std::unordered_map<Detouring::Hook*, DetourEntry> pDetourInfo;
+static std::unordered_map<unsigned int, std::unordered_set<Detouring::Hook*>> g_pDetours = {};
+void Detour::Create(Detouring::Hook* pHook, const char* strName, void* pModule, Symbol pSymbol, void* pHookFunc, unsigned int category, bool bEnable)
+{
+	if (pDisabledDetours.find(strName) != pDisabledDetours.end())
+	{
+		Msg(PROJECT_NAME ": Detour %s was disabled!\n", strName);
+		return;
+	}
+
+	if (pLoadedDetours.find(strName) != pLoadedDetours.end())
+	{
+		Warning(PROJECT_NAME ": Detour %s was already loaded! Are you using the same name twice?\n", strName);
+		// Do not return since that could still break it. Though still warn others!
+	}
+
+	void* func = Detour::GetFunction(pModule, pSymbol);
+	if (!CheckFunction(func, strName))
+		return;
+
+	pHook->Create(func, pHookFunc);
+
+	if (pDetourInfo.find(pHook) == pDetourInfo.end())
+		pDetourInfo[pHook] = {strName, category, pHookFunc, func};
+
+	if (!DETOUR_ISVALID((*pHook)))
+	{
+		Warning(PROJECT_NAME ": Failed to detour %s!\n", strName);
+		if (pFailedDetours.find(strName) == pFailedDetours.end())
+			pFailedDetours.insert(strName);
+	} else { // Loaded successfully
+		if (g_pDetours[category].find(pHook) == g_pDetours[category].end())
+			g_pDetours[category].insert(pHook);
+	}
+
+	if (bEnable)
+		Detour::EnableHook(pHook);
+	else
+		pHook->Destroy(); // We create dit just to verify.
+}
+
+void Detour::EnableHook(Detouring::Hook* pHook)
+{
+	auto it = pDetourInfo.find(pHook);
+	if (it == pDetourInfo.end())
+	{
+		Warning("Tried to use a hook that didn't go through Detour::Create!\n");
+		return;
+	}
+
+	pHook->Create(it->second.pTargetFunc, it->second.pHookFunc);
+	pHook->Enable();
+
+	if (pLoadedDetours.find(it->second.detourName) == pLoadedDetours.end())
+		pLoadedDetours[it->second.detourName] = it->second.nCategory;
+	else
+		Warning("Tried to use Detour::EnableHook on a hook that is already enabled! (%s)\n", it->second.detourName.c_str());
+}
+
+void Detour::DisableHook(Detouring::Hook* pHook)
+{
+	auto it = pDetourInfo.find(pHook);
+	if (it == pDetourInfo.end())
+	{
+		Warning("Tried to use a hook that didn't go through Detour::Create!\n");
+		return;
+	}
+
+	pHook->Disable();
+	pHook->Destroy();
+
+	auto loadedIT = pLoadedDetours.find(it->second.detourName);
+	if (loadedIT != pLoadedDetours.end())
+		pLoadedDetours.erase(loadedIT);
+	else
+		Warning("Tried to use Detour::DisableHook on a hook that is already enabled! (%s)\n", it->second.detourName.c_str());
+}
+
+void Detour::Remove(unsigned int category) // NOTE: Do we need to check if the provided category is valid?
+{
+	for (Detouring::Hook* hook : g_pDetours[category]) {
+		if (hook->IsEnabled())
+		{
+			hook->Disable();
+			hook->Destroy();
+		}
+
+		auto it = pDetourInfo.find(hook);
+		if (it != pDetourInfo.end())
+			pDetourInfo.erase(it);
+	}
+	g_pDetours[category].clear();
+
+	// Remove them from our loaded list.
+	for (auto it = pLoadedDetours.begin(); it != pLoadedDetours.end(); )
+	{
+		if (it->second == category)
+			it = pLoadedDetours.erase(it);
+		else
+			it++;
+	}
+}
+
+void Detour::ReportLeak()
+{
+	for (auto& [id, hooks]: g_pDetours)
+		if (hooks.size() > 0)
+			Msg(PROJECT_NAME ": ID %d failed to shutdown it's detours!\n", id);
+}
+
+const std::unordered_set<std::string>& Detour::GetDisabledDetours()
+{
+	return pDisabledDetours;
+}
+
+const std::unordered_set<std::string>& Detour::GetFailedDetours()
+{
+	return pFailedDetours;
+}
+
+const std::unordered_map<std::string, unsigned int>& Detour::GetLoadedDetours()
+{
+	return pLoadedDetours;
+}
