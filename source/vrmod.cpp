@@ -365,9 +365,15 @@ LUA_FUNCTION_STATIC(GetDisplayInfo)
 	return 1;
 }
 
+static std::atomic<bool> g_bCanUpdatePoses = false;
 LUA_FUNCTION_STATIC(UpdatePosesAndActions)
 {
-	vr::VRCompositor()->WaitGetPoses(g_poses, vr::k_unMaxTrackedDeviceCount, NULL, 0);
+	if (g_bCanUpdatePoses.load()) {
+		vr::VRCompositor()->WaitGetPoses(g_poses, vr::k_unMaxTrackedDeviceCount, NULL, 0);
+		g_bCanUpdatePoses.store(false);
+	} else
+		vr::VRCompositor()->GetLastPoses(g_poses, vr::k_unMaxTrackedDeviceCount, NULL, 0);
+
 	g_pInput->UpdateActionState(g_activeActionSets, sizeof(vr::VRActiveActionSet_t), g_activeActionSetCount);
 	return 0;
 }
@@ -655,6 +661,8 @@ static void SubmitVRFrame()
 
 	vr::VRCompositor()->Submit(vr::EVREye::Eye_Left, &g_vrTexture, &g_textureBoundsLeft);
 	vr::VRCompositor()->Submit(vr::EVREye::Eye_Right, &g_vrTexture, &g_textureBoundsRight);
+
+	g_bCanUpdatePoses.store(true);
 }
 
 static bool g_bSupportsMCore = false;
