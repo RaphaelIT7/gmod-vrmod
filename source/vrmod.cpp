@@ -19,6 +19,11 @@
 #include <unistd.h>
 #endif
 
+#include <atomic>
+#include <memory>
+#include <mutex>
+#include <shared_mutex>
+
 #include "detours.h"
 #include "symbols.h"
 #include "detouring/classproxy.hpp"
@@ -49,11 +54,12 @@ enum ELuaRefIndex
 	LuaRefIndex_Max,
 };
 
+constexpr int ACTION_REFERENCES = 2;
 typedef struct
 {
 	vr::VRActionHandle_t handle;
 	char fullname[MAX_STR_LEN];
-	int luaRefs[2];
+	int luaRefs[ACTION_REFERENCES] = {-1, -1};
 	char* name;
 	int type;
 } action;
@@ -66,6 +72,8 @@ typedef struct
 
 vr::IVRSystem*          g_pSystem = NULL;
 vr::IVRInput*           g_pInput = NULL;
+
+static std::shared_mutex g_pPoseAndActionMutex;
 vr::TrackedDevicePose_t g_poses[vr::k_unMaxTrackedDeviceCount];
 actionSet               g_actionSets[MAX_ACTIONSETS];
 int                     g_actionSetCount = 0;
@@ -73,14 +81,12 @@ vr::VRActiveActionSet_t g_activeActionSets[MAX_ACTIONSETS];
 int                     g_activeActionSetCount = 0;
 action                  g_actions[MAX_ACTIONS];
 int                     g_actionCount = 0;
+
 char                    g_errorString[MAX_STR_LEN];
-vr::VRTextureBounds_t   g_textureBoundsLeft;
-vr::VRTextureBounds_t   g_textureBoundsRight;
-vr::Texture_t           g_vrTexture;
-int                     g_luaRefs[LuaRefIndex_Max];
-int                     g_luaRefCount = 0;
+int                     g_luaRefs[LuaRefIndex_Max] = {-1, -1, -1, -1};
 
 char                    g_createTextureOrigBytes[14];
+
 #ifdef _WIN32
 typedef HRESULT         (APIENTRY* CreateTexture)(IDirect3DDevice9*, UINT, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL, IDirect3DTexture9**, HANDLE*);
 CreateTexture           g_createTexture = NULL;
@@ -91,7 +97,7 @@ IDirect3DDevice9*       g_pD3D9Device = NULL;
 typedef void*           (*CreateInterfaceFn)(const char* pName, int* pReturnCode);
 HRESULT APIENTRY CreateTextureHook(IDirect3DDevice9* pDevice, UINT w, UINT h, UINT levels, DWORD usage, D3DFORMAT format, D3DPOOL pool, IDirect3DTexture9** tex, HANDLE* shared_handle)
 {
-	if (WriteProcessMemory(GetCurrentProcess(), g_createTexture, g_createTextureOrigBytes, 14, NULL) == 0)
+	if (WriteProcessMemory(GetCurrentProcess(), g_createTexture, g_createTextureOrigBytes, sizeof(g_createTextureOrigBytes), NULL) == 0)
 		MessageBoxA(NULL, "WriteProcessMemory from hook failed", "", NULL);
 
 	if (g_sharedTexture == NULL)
@@ -123,7 +129,7 @@ void*                   g_createTexture = NULL;
 GLuint                  g_sharedTexture = GL_INVALID_VALUE;
 COpenGLEntryPoints*     g_GL = NULL;
 void CreateTextureHook(GLsizei n, GLuint *textures) {
-	memcpy((void*)g_createTexture, (void*)g_createTextureOrigBytes, 14);
+	memcpy((void*)g_createTexture, (void*)g_createTextureOrigBytes, sizeof(g_createTextureOrigBytes));
 	((glGenTextures_t)g_createTexture)(n, textures);
 	g_sharedTexture = textures[0];
 	return;
@@ -132,7 +138,7 @@ void CreateTextureHook(GLsizei n, GLuint *textures) {
 
 LUA_FUNCTION_STATIC(GetVersion)
 {
-	LUA->PushNumber(23);
+	LUA->PushNumber(24);
 	return 1;
 }
 
@@ -162,7 +168,6 @@ LUA_FUNCTION_STATIC(Init)
 	{
 		LUA->CreateTable();
 		g_luaRefs[i] = LUA->ReferenceCreate();
-		g_luaRefCount++;
 	}
 #ifdef _WIN32
 	HMODULE hMod = GetModuleHandleA("shaderapidx9.dll");
@@ -282,6 +287,8 @@ LUA_FUNCTION_STATIC(SetActionManifest)
 
 LUA_FUNCTION_STATIC(SetActiveActionSets)
 {
+	std::unique_lock<std::shared_mutex> writeLock(g_pPoseAndActionMutex);
+
 	g_activeActionSetCount = 0;
 	for (int i = 0; i < MAX_ACTIONSETS; i++)
 	{
@@ -365,21 +372,9 @@ LUA_FUNCTION_STATIC(GetDisplayInfo)
 	return 1;
 }
 
-static std::atomic<bool> g_bCanUpdatePoses = false;
-LUA_FUNCTION_STATIC(UpdatePosesAndActions)
-{
-	if (g_bCanUpdatePoses.load()) {
-		vr::VRCompositor()->WaitGetPoses(g_poses, vr::k_unMaxTrackedDeviceCount, NULL, 0);
-		g_bCanUpdatePoses.store(false);
-	} else
-		vr::VRCompositor()->GetLastPoses(g_poses, vr::k_unMaxTrackedDeviceCount, NULL, 0);
-
-	g_pInput->UpdateActionState(g_activeActionSets, sizeof(vr::VRActiveActionSet_t), g_activeActionSetCount);
-	return 0;
-}
-
 LUA_FUNCTION_STATIC(GetPoses)
 {
+	std::shared_lock<std::shared_mutex> readLock(g_pPoseAndActionMutex);
 	vr::InputPoseActionData_t poseActionData;
 	vr::TrackedDevicePose_t pose = g_poses[0];
 	char* poseName = (char*)"hmd";
@@ -506,8 +501,40 @@ LUA_FUNCTION_STATIC(GetActions)
 	return 2;
 }
 
-LUA_FUNCTION_STATIC(ShareTextureBegin)
+enum class VRFrameState
 {
+	FRAME_NONE, // Waiting
+	FRAME_RENDERING, // Still working
+	FRAME_DONE, // Ready for submit
+};
+
+struct VRRenderTarget
+{
+	int id = -1;
+	std::atomic<VRFrameState> state = VRFrameState::FRAME_NONE;
+	vr::VRTextureBounds_t leftBounds;
+	vr::VRTextureBounds_t rightBounds;
+	vr::Texture_t texture;
+};
+
+static thread_local VRRenderTarget* g_pCurrentVRTarget = nullptr;
+static std::unordered_map<void*, VRRenderTarget*> g_pVRRenderTargets;
+static std::shared_mutex g_pVRRenderTargetMutex;
+
+LUA_FUNCTION_STATIC(RegisterRenderContext)
+{
+	if (!g_pMaterialSystem)
+		LUA->ThrowError("Failed to load g_pMaterialSystem!");
+
+	{
+		IMatRenderContext* pContext = g_pMaterialSystem->GetRenderContext();
+
+		std::shared_lock<std::shared_mutex> readLock(g_pVRRenderTargetMutex);
+		auto it = g_pVRRenderTargets.find(pContext);
+		if (it != g_pVRRenderTargets.end()) // already exists!
+			LUA->ThrowError("Tried to call RegisterRenderContext when the context is already registered!");
+	}
+
 	char patch[] = "\x68\x0\x0\x0\x0\xC3\x44\x24\x04\x0\x0\x0\x0\xC3";
 	*(uint32_t*)(patch + 1) = (uint32_t)((uintptr_t)CreateTextureHook);
 #if defined _WIN64 || defined __x86_64__
@@ -529,11 +556,16 @@ LUA_FUNCTION_STATIC(ShareTextureBegin)
 	memcpy((void*)g_createTextureOrigBytes, (void*)g_createTexture, 14);
 	memcpy((void*)g_createTexture, (void*)patch, 14);
 #endif
+
+	g_pCurrentVRTarget = new VRRenderTarget;
 	return 0;
 }
 
-LUA_FUNCTION_STATIC(ShareTextureFinish)
+LUA_FUNCTION_STATIC(FinishRegisterRenderContext)
 {
+	if (!g_pCurrentVRTarget)
+		LUA->ThrowError("Tried to use SetContextTextureBounds outside of RegisterRenderContext!");
+
 #ifdef _WIN32
 	if (g_sharedTexture == NULL)
 		LUA->ThrowError("g_sharedTexture is null");
@@ -547,49 +579,106 @@ LUA_FUNCTION_STATIC(ShareTextureFinish)
 
 	if (FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&g_d3d11Texture)))
 		LUA->ThrowError("QueryInterface failed");
-
-	g_vrTexture.handle = g_d3d11Texture;
-	g_vrTexture.eType = vr::TextureType_DirectX;
 #else
 	if (g_sharedTexture == GL_INVALID_VALUE)
 		LUA->ThrowError("g_sharedTexture is invalid");
-
-	g_vrTexture.handle = (void*)(uintptr_t)g_sharedTexture;
-	g_vrTexture.eType = vr::TextureType_OpenGL;
 #endif
 
-	g_vrTexture.eColorSpace = vr::ColorSpace_Auto;
+#ifdef _WIN32
+	g_pCurrentVRTarget->texture.handle = g_d3d11Texture;
+	g_pCurrentVRTarget->texture.eType = vr::TextureType_DirectX;
+#else
+	g_pCurrentVRTarget->texture.handle = (void*)(uintptr_t)g_sharedTexture;
+	g_pCurrentVRTarget->texture.eType = vr::TextureType_OpenGL;
+#endif
+
+	g_pCurrentVRTarget->texture.eColorSpace = vr::ColorSpace_Auto;
+
+	int renderID = (int)LUA->CheckNumber(1);
+	IMatRenderContext* pContext = g_pMaterialSystem->GetRenderContext();
+
+	std::unique_lock<std::shared_mutex> writeLock(g_pVRRenderTargetMutex);
+	auto it = g_pVRRenderTargets.find(pContext);
+	if (it != g_pVRRenderTargets.end())
+	{
+		delete g_pCurrentVRTarget;
+		g_pCurrentVRTarget = nullptr;
+		LUA->ThrowError("Tried to register a context that was already registered? (Report this)");
+	} else {
+		g_pCurrentVRTarget->id = renderID;
+		g_pVRRenderTargets[pContext] = g_pCurrentVRTarget;
+		g_pCurrentVRTarget = nullptr;
+
+#ifdef _WIN32
+		g_d3d11Texture = NULL;
+		g_sharedTexture = NULL;
+#else
+		g_sharedTexture = GL_INVALID_VALUE;
+#endif
+	}
+
 	return 0;
 }
 
-LUA_FUNCTION_STATIC(SetSubmitTextureBounds)
+LUA_FUNCTION_STATIC(SetContextTextureBounds)
 {
-	g_textureBoundsLeft.uMin = (float)LUA->CheckNumber(1);
-	g_textureBoundsLeft.vMin = (float)LUA->CheckNumber(2);
-	g_textureBoundsLeft.uMax = (float)LUA->CheckNumber(3);
-	g_textureBoundsLeft.vMax = (float)LUA->CheckNumber(4);
-	g_textureBoundsRight.uMin = (float)LUA->CheckNumber(5);
-	g_textureBoundsRight.vMin = (float)LUA->CheckNumber(6);
-	g_textureBoundsRight.uMax = (float)LUA->CheckNumber(7);
-	g_textureBoundsRight.vMax = (float)LUA->CheckNumber(8);
+	if (!g_pCurrentVRTarget)
+		LUA->ThrowError("Tried to use SetContextTextureBounds outside of RegisterRenderContext!");
+
+	// We check all types first to avoid issues like only half of the bounds being set
+	LUA->CheckType(1, GarrysMod::Lua::Type::Number);
+	LUA->CheckType(2, GarrysMod::Lua::Type::Number);
+	LUA->CheckType(3, GarrysMod::Lua::Type::Number);
+	LUA->CheckType(4, GarrysMod::Lua::Type::Number);
+	LUA->CheckType(5, GarrysMod::Lua::Type::Number);
+	LUA->CheckType(6, GarrysMod::Lua::Type::Number);
+	LUA->CheckType(7, GarrysMod::Lua::Type::Number);
+	LUA->CheckType(8, GarrysMod::Lua::Type::Number);
+
+	g_pCurrentVRTarget->leftBounds.uMin = (float)LUA->GetNumber(1);
+	g_pCurrentVRTarget->leftBounds.vMin = (float)LUA->GetNumber(2);
+	g_pCurrentVRTarget->leftBounds.uMax = (float)LUA->GetNumber(3);
+	g_pCurrentVRTarget->leftBounds.vMax = (float)LUA->GetNumber(4);
+	g_pCurrentVRTarget->rightBounds.uMin = (float)LUA->GetNumber(5);
+	g_pCurrentVRTarget->rightBounds.vMin = (float)LUA->GetNumber(6);
+	g_pCurrentVRTarget->rightBounds.uMax = (float)LUA->GetNumber(7);
+	g_pCurrentVRTarget->rightBounds.vMax = (float)LUA->GetNumber(8);
+
 	return 0;
 }
 
 LUA_FUNCTION_STATIC(Shutdown)
 {
+	if (g_pSubmitThread)
+	{
+		g_bRunSubmitThread.store(false);
+		ThreadJoin(g_pSubmitThread);
+		g_pSubmitThread = nullptr;
+	}
+
 	if (g_pSystem != NULL)
 	{
 		vr::VR_Shutdown();
 		g_pSystem = NULL;
 	}
 
-	for (int i = 0; i < g_luaRefCount; i++)
-		LUA->ReferenceFree(g_luaRefs[i]);
+	for (int i = 0; i < LuaRefIndex_Max; i++) {
+		if (g_luaRefs[i] == -1)
+			continue;
 
-	g_luaRefCount = 0;
-	for (int i = 0; i < g_actionCount; i++)
-		for (int j = 0; j < 2; j++)
+		LUA->ReferenceFree(g_luaRefs[i]);
+		g_luaRefs[i] = -1;
+	}
+
+	for (int i = 0; i < MAX_ACTIONS; i++) {
+		for (int j = 0; j < ACTION_REFERENCES; j++) {
+			if (g_actions[i].luaRefs[j] == -1)
+				continue;
+
 			LUA->ReferenceFree(g_actions[i].luaRefs[j]);
+			g_actions[i].luaRefs[j] = -1;
+		}
+	}
 
 	g_actionCount = 0;
 	g_actionSetCount = 0;
@@ -643,26 +732,69 @@ LUA_FUNCTION_STATIC(GetTrackedDeviceNames)
 	return 1;
 }
 
-static void SubmitVRFrame()
+static std::list<VRRenderTarget*> g_pRenderOrder;
+static std::mutex g_pRenderOrderMutex;
+static void SubmitVRFrame(IMatRenderContext* context)
 {
-#ifdef _WIN32
-	if (g_d3d11Texture == NULL)
-		return;
-
-	IDirect3DQuery9* pEventQuery = nullptr;
-	g_pD3D9Device->CreateQuery(D3DQUERYTYPE_EVENT, &pEventQuery);
-	if (pEventQuery != nullptr)
+	std::shared_lock<std::shared_mutex> readLock(g_pVRRenderTargetMutex);
+	auto it = g_pVRRenderTargets.find(context);
+	if (it != g_pVRRenderTargets.end())
 	{
-		pEventQuery->Issue(D3DISSUE_END);
-		while (pEventQuery->GetData(nullptr, 0, D3DGETDATA_FLUSH) != S_OK);
-		pEventQuery->Release();
+		VRRenderTarget* pTarget = it->second;
+		if (pTarget->state.load() != VRFrameState::FRAME_RENDERING)
+			return;
+
+		pTarget->state.store(VRFrameState::FRAME_DONE);
+		Msg("SubmitVRFrame was called (%i - %p)\n", pTarget->id, context);
+
+		std::lock_guard<std::mutex> lock(g_pRenderOrderMutex);
+		g_pRenderOrder.push_back(pTarget);
 	}
+}
+
+static ThreadHandle_t g_pSubmitThread = nullptr;
+static std::atomic<bool> g_bRunSubmitThread = false;
+static SIMPLETHREAD_RETURNVALUE VRSubmitThread(void* data)
+{
+	while (g_bRunSubmitThread.load())
+	{
+		ThreadSleep(10);
+
+		VRRenderTarget* pTarget = nullptr;
+		{
+			std::lock_guard<std::mutex> lock(g_pRenderOrderMutex);
+			if (g_pRenderOrder.empty())
+				continue;
+
+			pTarget = g_pRenderOrder.front();
+			g_pRenderOrder.pop_front();
+		}
+
+#ifdef _WIN32
+		IDirect3DQuery9* pEventQuery = nullptr;
+		g_pD3D9Device->CreateQuery(D3DQUERYTYPE_EVENT, &pEventQuery);
+		if (pEventQuery != nullptr)
+		{
+			pEventQuery->Issue(D3DISSUE_END);
+			while (pEventQuery->GetData(nullptr, 0, D3DGETDATA_FLUSH) != S_OK);
+			pEventQuery->Release();
+		}
 #endif
 
-	vr::VRCompositor()->Submit(vr::EVREye::Eye_Left, &g_vrTexture, &g_textureBoundsLeft);
-	vr::VRCompositor()->Submit(vr::EVREye::Eye_Right, &g_vrTexture, &g_textureBoundsRight);
+		Msg("Left Submit: %i\n", (int)vr::VRCompositor()->Submit(vr::EVREye::Eye_Left, &pTarget->texture, &pTarget->leftBounds, vr::Submit_FrameDiscontinuity));
+		Msg("Right Submit: %i\n", (int)vr::VRCompositor()->Submit(vr::EVREye::Eye_Right, &pTarget->texture, &pTarget->rightBounds, vr::Submit_FrameDiscontinuity));
 
-	g_bCanUpdatePoses.store(true);
+		vr::VRCompositor()->PostPresentHandoff();
+		pTarget->state.store(VRFrameState::FRAME_NONE); // Ready for main thread to render again
+
+		std::unique_lock<std::shared_mutex> writeLock(g_pPoseAndActionMutex);
+		vr::VRCompositor()->WaitGetPoses(g_poses, vr::k_unMaxTrackedDeviceCount, NULL, 0);
+		g_pInput->UpdateActionState(g_activeActionSets, sizeof(vr::VRActiveActionSet_t), g_activeActionSetCount);
+
+		Msg("Rendered frame %i to VR composer\n", pTarget->id);
+	}
+
+	return 0;
 }
 
 static bool g_bSupportsMCore = false;
@@ -696,10 +828,12 @@ public:
 
 	virtual void EndFrame()
 	{
+		IMatRenderContext* pContext = g_pMaterialSystem->GetRenderContext();
+
 		Call(&IMaterialSystem::EndFrame);
 		
 		if (!detour_CMatQueuedRenderContext_CallQueued.IsValid() || This()->GetThreadMode() == MaterialThreadMode_t::MATERIAL_SINGLE_THREADED)
-			SubmitVRFrame();
+			SubmitVRFrame(pContext);
 	}
 };
 
@@ -714,7 +848,55 @@ LUA_FUNCTION_STATIC(SubmitSharedTexture)
 	if (g_bSupportsMCore)
 		return 0;
 
-	SubmitVRFrame();
+	IMatRenderContext* pContext = g_pMaterialSystem->GetRenderContext();
+	if (!pContext)
+		LUA->ThrowError("Tried to call SubmitSharedTexture outside a render context!");
+
+	SubmitVRFrame(pContext);
+	return 0;
+}
+
+LUA_FUNCTION_STATIC(GetRenderContextID)
+{
+	if (!g_pMaterialSystem)
+		LUA->ThrowError("Failed to load g_pMaterialSystem!");
+
+	IMatRenderContext* pContext = g_pMaterialSystem->GetRenderContext();
+	std::shared_lock<std::shared_mutex> readLock(g_pVRRenderTargetMutex);
+	auto it = g_pVRRenderTargets.find(pContext);
+	if (it != g_pVRRenderTargets.end())
+	{
+		if (it->second->state.load() != VRFrameState::FRAME_NONE)
+		{
+			Msg("Found ID %i for Context %p - skipping frame as their waiting for render!\n", it->second->id, pContext);
+			LUA->PushNumber(-2);
+			return 1;
+		}
+
+		Msg("Found ID %i for Context %p\n", it->second->id, pContext);
+		LUA->PushNumber(it->second->id);
+		return 1;
+	}
+
+	Msg("No ID found for Context %p\n", pContext);
+	LUA->PushNumber(-1);
+	return 1;
+}
+
+LUA_FUNCTION_STATIC(MarkContextRendering)
+{
+	if (!g_pMaterialSystem)
+		LUA->ThrowError("Failed to load g_pMaterialSystem!");
+
+	IMatRenderContext* pContext = g_pMaterialSystem->GetRenderContext();
+	std::shared_lock<std::shared_mutex> readLock(g_pVRRenderTargetMutex);
+	auto it = g_pVRRenderTargets.find(pContext);
+	if (it != g_pVRRenderTargets.end())
+	{
+		if (it->second->state.load() == VRFrameState::FRAME_NONE)
+			it->second->state.store(VRFrameState::FRAME_RENDERING);
+	}
+
 	return 0;
 }
 
@@ -723,7 +905,7 @@ static void hook_CMatQueuedRenderContext_CallQueued(IMatRenderContext* context, 
 	detour_CMatQueuedRenderContext_CallQueued.GetTrampoline<Symbols::CMatQueuedRenderContext_CallQueued>()(context, bTermAfterCall);
 
 	if (g_pMaterialSystem->GetThreadMode() != MaterialThreadMode_t::MATERIAL_SINGLE_THREADED)
-		SubmitVRFrame();
+		SubmitVRFrame(context);
 }
 
 #if SYSTEM_WINDOWS
@@ -742,12 +924,13 @@ GMOD_MODULE_OPEN()
 		Util::AddFunc(LUA, SetActionManifest, "SetActionManifest");
 		Util::AddFunc(LUA, SetActiveActionSets, "SetActiveActionSets");
 		Util::AddFunc(LUA, GetDisplayInfo, "GetDisplayInfo");
-		Util::AddFunc(LUA, UpdatePosesAndActions, "UpdatePosesAndActions");
 		Util::AddFunc(LUA, GetPoses, "GetPoses");
 		Util::AddFunc(LUA, GetActions, "GetActions");
-		Util::AddFunc(LUA, ShareTextureBegin, "ShareTextureBegin");
-		Util::AddFunc(LUA, ShareTextureFinish, "ShareTextureFinish");
-		Util::AddFunc(LUA, SetSubmitTextureBounds, "SetSubmitTextureBounds");
+		Util::AddFunc(LUA, RegisterRenderContext, "RegisterRenderContext");
+		Util::AddFunc(LUA, FinishRegisterRenderContext, "FinishRegisterRenderContext");
+		Util::AddFunc(LUA, GetRenderContextID, "GetRenderContextID");
+		Util::AddFunc(LUA, SetContextTextureBounds, "SetContextTextureBounds");
+		Util::AddFunc(LUA, MarkContextRendering, "MarkContextRendering");
 		Util::AddFunc(LUA, SubmitSharedTexture, "SubmitSharedTexture");
 		Util::AddFunc(LUA, Shutdown, "Shutdown");
 		Util::AddFunc(LUA, TriggerHaptic, "TriggerHaptic");
@@ -773,6 +956,9 @@ GMOD_MODULE_OPEN()
 		(void*)DETOUR_THISCALL(hook_CMatQueuedRenderContext_CallQueued, CallQueued), 0
 	);
 
+	g_bRunSubmitThread.store(true);
+	g_pSubmitThread = CreateSimpleThread((ThreadFunc_t)VRSubmitThread, nullptr);
+
 	return 0;
 }
 
@@ -783,6 +969,13 @@ GMOD_MODULE_CLOSE()
 		g_pMaterialSystemProxy->DeInit();
 		delete g_pMaterialSystemProxy;
 		g_pMaterialSystemProxy = nullptr;
+	}
+
+	if (g_pSubmitThread)
+	{
+		g_bRunSubmitThread.store(false);
+		ThreadJoin(g_pSubmitThread);
+		g_pSubmitThread = nullptr;
 	}
 
 	Detour::Remove(0);

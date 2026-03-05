@@ -14,6 +14,12 @@
 #define GMCOMMON_CALLING_CONVENTION
 #endif
 
+#if ARCHITECTURE_IS_X86_64
+#define SIMPLETHREAD_RETURNVALUE long long unsigned
+#else
+#define SIMPLETHREAD_RETURNVALUE unsigned
+#endif
+
 class IMatRenderContext;
 
 /*

@@ -260,10 +260,6 @@ if CLIENT then
 			rtWidth, rtHeight = math.min(4096,pow2ceil(rtWidth)), math.min(4096,pow2ceil(rtHeight)) --todo pow2ceil might not be necessary
 		end
 		
-		VRMOD_ShareTextureBegin()
-		g_VR.rt = GetRenderTarget( "vrmod_rt".. tostring(SysTime()), rtWidth, rtHeight)
-		VRMOD_ShareTextureFinish()
-		
 		--
 		local displayCalculations = { left = {}, right = {}}
 		
@@ -294,7 +290,6 @@ if CLIENT then
 		local uMaxRight = 1.0 + displayCalculations.right.HorizontalOffset * 0.25
 		local vMinRight = vMin - displayCalculations.right.VerticalOffset * 0.5
 		local vMaxRight = vMax - displayCalculations.right.VerticalOffset * 0.5
-		VRMOD_SetSubmitTextureBounds(uMinLeft, vMinLeft, uMaxLeft, vMaxLeft, uMinRight, vMinRight, uMaxRight, vMaxRight)
 		
 		local hfovLeft = displayCalculations.left.HorizontalFOV
 		local hfovRight = displayCalculations.right.HorizontalFOV
@@ -389,16 +384,15 @@ if CLIENT then
 		local desktopView = convars.vrmod_desktopview:GetInt()
 		local cropVerticalMargin = (1 - (ScrH()/ScrW() * (rtWidth/2) / rtHeight)) / 2
 		local cropHorizontalOffset = (desktopView==3) and 0.5 or 0
-		local mat_rt = CreateMaterial("vrmod_mat_rt"..tostring(SysTime()), "UnlitGeneric",{ ["$basetexture"] = g_VR.rt:GetName() })
-			
+
 		local localply = LocalPlayer()
 		local currentViewEnt = localply
 		local pos1, ang1
-			
+		
+		g_VR.vrData = {}
 		hook.Add("RenderScene","vrutil_hook_renderscene",function()
 			
 			VRMOD_SubmitSharedTexture()
-			VRMOD_UpdatePosesAndActions()
 
 			--handle tracking
 			local rawPoses = VRMOD_GetPoses()
@@ -480,42 +474,61 @@ if CLIENT then
 			g_VR.eyePosLeft = g_VR.view.origin + g_VR.view.angles:Right()*-(ipd*0.5*g_VR.scale)
 			g_VR.eyePosRight = g_VR.view.origin + g_VR.view.angles:Right()*(ipd*0.5*g_VR.scale)
 
-			render.PushRenderTarget( g_VR.rt )
+			-- If GetRenderContextID then the internal render context was never prepared.
+			-- In mcore GMod will use multiple render contexts, and for each we need their own render target as else we can't render safely!
+			-- (In past experience multiple render contextes tried to render onto the same render target!)
+			local renderID = VRMOD_GetRenderContextID()
+			if renderID == -1 then
+				renderID = (g_VR.vrData.NEXT_ID or 0) + 1
+				g_VR.vrData.NEXT_ID = renderID
 
-				-- left
-				g_VR.view.origin = g_VR.eyePosLeft
-				g_VR.view.x = 0
-				g_VR.view.fov = hfovLeft
-				g_VR.view.aspectratio = aspectLeft
-				hook.Call("VRMod_PreRender")
-				render.RenderView(g_VR.view)
-				-- right
-				
-				g_VR.view.origin = g_VR.eyePosRight
-				g_VR.view.x = rtWidth/2
-				g_VR.view.fov = hfovRight
-				g_VR.view.aspectratio = aspectRight
-				hook.Call("VRMod_PreRenderRight")
-				render.RenderView(g_VR.view)
-				--
-				if not LocalPlayer():Alive() then
-					cam.Start2D()
-					surface.SetDrawColor( 255, 0, 0, 128 )
-					surface.DrawRect( 0, 0, rtWidth, rtHeight )
-					cam.End2D()
-				end
-			
+				VRMOD_RegisterRenderContext()
+				local rt = GetRenderTarget( "vrmod_rt_" .. renderID, rtWidth, rtHeight)
+				VRMOD_SetContextTextureBounds(uMinLeft, vMinLeft, uMaxLeft, vMaxLeft, uMinRight, vMinRight, uMaxRight, vMaxRight)
+				VRMOD_FinishRegisterRenderContext(renderID)
 
-			render.PopRenderTarget( g_VR.rt )
-			
-			if desktopView > 1 then
-				surface.SetDrawColor(255,255,255,255)
-				surface.SetMaterial(mat_rt)
-				render.CullMode(1)
-				surface.DrawTexturedRectUV(-1, -1, 2, 2, cropHorizontalOffset, 1-cropVerticalMargin, 0.5+cropHorizontalOffset, cropVerticalMargin)
-				render.CullMode(0)
+				local mat = CreateMaterial("vrmod_mat_rt_" .. renderID, "UnlitGeneric",{ ["$basetexture"] = rt:GetName() })
+				table.insert(g_VR.vrData, {
+					renderTarget = rt,
+					material = mat,
+				})
 			end
-			
+
+			-- If -2 then the current rendering context frame is waiting to be submitted to VR - so we must skip, but we keep GMod rendering
+			local renderContextData = renderID ~= -2 and g_VR.vrData[renderID] or nil
+			if renderContextData then
+				render.PushRenderTarget( renderContextData.renderTarget )
+
+					-- left
+					g_VR.view.origin = g_VR.eyePosLeft
+					g_VR.view.x = 0
+					g_VR.view.fov = hfovLeft
+					g_VR.view.aspectratio = aspectLeft
+					hook.Call("VRMod_PreRender")
+					render.RenderView(g_VR.view)
+					-- right
+					
+					g_VR.view.origin = g_VR.eyePosRight
+					g_VR.view.x = rtWidth/2
+					g_VR.view.fov = hfovRight
+					g_VR.view.aspectratio = aspectRight
+					hook.Call("VRMod_PreRenderRight")
+					render.RenderView(g_VR.view)
+					--
+					if not LocalPlayer():Alive() then
+						cam.Start2D()
+						surface.SetDrawColor( 255, 0, 0, 128 )
+						surface.DrawRect( 0, 0, rtWidth, rtHeight )
+						cam.End2D()
+					end
+				
+
+				render.PopRenderTarget( renderContextData.renderTarget )
+
+				-- Tell us that you're done and we can officially mark the render context to be working
+				VRMOD_MarkContextRendering(renderID)
+			end
+
 			hook.Call("VRMod_PostRender")
 			
 			--return true to override default scene rendering

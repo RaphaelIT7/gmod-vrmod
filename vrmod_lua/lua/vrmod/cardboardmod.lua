@@ -149,7 +149,6 @@ concommand.Add( "cardboardmod_start", function( ply, cmd, args )
 	
 	hook.Add("RenderScene","cardboardmod_renderscene",function(viewOrigin, viewAngles)
 		VRMOD_SubmitSharedTexture()
-		VRMOD_UpdatePosesAndActions()
 
 		tracking = VRMOD_GetPoses()
 		
