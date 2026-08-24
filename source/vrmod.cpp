@@ -654,11 +654,13 @@ LUA_FUNCTION_STATIC(SetContextTextureBounds)
 	return 0;
 }
 
+static std::condition_variable g_SubmitCV;
 LUA_FUNCTION_STATIC(Shutdown)
 {
 	if (g_pSubmitThread)
 	{
 		g_bRunSubmitThread.store(false);
+		g_SubmitCV.notify_one();
 		ThreadJoin(g_pSubmitThread);
 		g_pSubmitThread = nullptr;
 	}
@@ -691,12 +693,6 @@ LUA_FUNCTION_STATIC(Shutdown)
 	g_actionSetCount = 0;
 	g_activeActionSetCount = 0;
 #ifdef _WIN32
-	if (g_d3d11Device != NULL)
-	{
-		g_d3d11Device->Release();
-		g_d3d11Device = NULL;
-	}
-
 	g_d3d11Texture = NULL;
 	g_pD3D9Device = NULL;
 	g_sharedTexture = NULL;
@@ -739,8 +735,8 @@ LUA_FUNCTION_STATIC(GetTrackedDeviceNames)
 	return 1;
 }
 
-static std::list<VRRenderTarget*> g_pRenderOrder;
-static std::mutex g_pRenderOrderMutex;
+static std::mutex g_RenderOrderMutex;
+static std::list<VRRenderTarget*> g_RenderOrder;
 static void SubmitVRFrame(IMatRenderContext* context)
 {
 	std::shared_lock<std::shared_mutex> readLock(g_pVRRenderTargetMutex);
@@ -754,8 +750,12 @@ static void SubmitVRFrame(IMatRenderContext* context)
 		pTarget->state.store(VRFrameState::FRAME_DONE);
 		Msg("SubmitVRFrame was called (%i - %p)\n", pTarget->id, context);
 
-		std::lock_guard<std::mutex> lock(g_pRenderOrderMutex);
-		g_pRenderOrder.push_back(pTarget);
+		{
+			std::lock_guard<std::mutex> lock(g_RenderOrderMutex);
+			g_RenderOrder.push_back(pTarget);
+		}
+
+		g_SubmitCV.notify_one();
 	}
 }
 
@@ -763,16 +763,18 @@ static SIMPLETHREAD_RETURNVALUE VRSubmitThread(void* data)
 {
 	while (g_bRunSubmitThread.load())
 	{
-		ThreadSleep(10);
-
 		VRRenderTarget* pTarget = nullptr;
 		{
-			std::lock_guard<std::mutex> lock(g_pRenderOrderMutex);
-			if (g_pRenderOrder.empty())
+			std::unique_lock<std::mutex> lock(g_RenderOrderMutex);
+			g_SubmitCV.wait(lock, [] {
+				return !g_bRunSubmitThread || !g_RenderOrder.empty();
+			});
+
+			if (g_RenderOrder.empty())
 				continue;
 
-			pTarget = g_pRenderOrder.front();
-			g_pRenderOrder.pop_front();
+			pTarget = g_RenderOrder.front();
+			g_RenderOrder.pop_front();
 		}
 
 #ifdef _WIN32
@@ -790,11 +792,12 @@ static SIMPLETHREAD_RETURNVALUE VRSubmitThread(void* data)
 		Msg("Right Submit: %i\n", (int)vr::VRCompositor()->Submit(vr::EVREye::Eye_Right, &pTarget->texture, &pTarget->rightBounds, vr::Submit_FrameDiscontinuity));
 
 		vr::VRCompositor()->PostPresentHandoff();
-		pTarget->state.store(VRFrameState::FRAME_NONE); // Ready for main thread to render again
 
 		std::unique_lock<std::shared_mutex> writeLock(g_pPoseAndActionMutex);
 		vr::VRCompositor()->WaitGetPoses(g_poses, vr::k_unMaxTrackedDeviceCount, NULL, 0);
 		g_pInput->UpdateActionState(g_activeActionSets, sizeof(vr::VRActiveActionSet_t), g_activeActionSetCount);
+
+		pTarget->state.store(VRFrameState::FRAME_NONE); // Ready for main thread to render again
 
 		Msg("Rendered frame %i to VR composer\n", pTarget->id);
 	}
@@ -899,7 +902,11 @@ LUA_FUNCTION_STATIC(MarkContextRendering)
 	if (it != g_pVRRenderTargets.end())
 	{
 		if (it->second->state.load() == VRFrameState::FRAME_NONE)
+		{
+			Msg("ID %i for Context %p - entering rendering!\n", it->second->id, pContext);
 			it->second->state.store(VRFrameState::FRAME_RENDERING);
+		}
+	}
 	}
 
 	return 0;
@@ -976,6 +983,7 @@ GMOD_MODULE_CLOSE()
 	if (g_pSubmitThread)
 	{
 		g_bRunSubmitThread.store(false);
+		g_SubmitCV.notify_one();
 		ThreadJoin(g_pSubmitThread);
 		g_pSubmitThread = nullptr;
 	}

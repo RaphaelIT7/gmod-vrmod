@@ -391,9 +391,6 @@ if CLIENT then
 		
 		g_VR.vrData = {}
 		hook.Add("RenderScene","vrutil_hook_renderscene",function()
-			
-			VRMOD_SubmitSharedTexture()
-
 			--handle tracking
 			local rawPoses = VRMOD_GetPoses()
 			for k,v in pairs(rawPoses) do
@@ -497,6 +494,9 @@ if CLIENT then
 			-- If -2 then the current rendering context frame is waiting to be submitted to VR - so we must skip, but we keep GMod rendering
 			local renderContextData = renderID ~= -2 and g_VR.vrData[renderID] or nil
 			if renderContextData then
+				-- Tell us that you're done and we can officially mark the render context to be working
+				VRMOD_MarkContextRendering(renderID)
+			
 				render.PushRenderTarget( renderContextData.renderTarget )
 
 					-- left
@@ -524,12 +524,11 @@ if CLIENT then
 				
 
 				render.PopRenderTarget( renderContextData.renderTarget )
-
-				-- Tell us that you're done and we can officially mark the render context to be working
-				VRMOD_MarkContextRendering(renderID)
 			end
 
 			hook.Call("VRMod_PostRender")
+			
+			VRMOD_SubmitSharedTexture()
 			
 			--return true to override default scene rendering
 			return true
