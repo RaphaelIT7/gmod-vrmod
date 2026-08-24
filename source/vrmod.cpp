@@ -148,10 +148,17 @@ LUA_FUNCTION_STATIC(IsHMDPresent)
 	return 1;
 }
 
+static SIMPLETHREAD_RETURNVALUE VRSubmitThread(void* data);
+
+static ThreadHandle_t g_pSubmitThread = nullptr;
+static std::atomic<bool> g_bRunSubmitThread = false;
 LUA_FUNCTION_STATIC(Init)
 {
 	if (g_pSystem != NULL)
 		LUA->ThrowError("Already initialized");
+
+	g_bRunSubmitThread.store(true);
+	g_pSubmitThread = CreateSimpleThread((ThreadFunc_t)VRSubmitThread, nullptr);
 
 	vr::HmdError error = vr::VRInitError_None;
 	g_pSystem = vr::VR_Init(&error, vr::VRApplication_Scene);
@@ -752,8 +759,6 @@ static void SubmitVRFrame(IMatRenderContext* context)
 	}
 }
 
-static ThreadHandle_t g_pSubmitThread = nullptr;
-static std::atomic<bool> g_bRunSubmitThread = false;
 static SIMPLETHREAD_RETURNVALUE VRSubmitThread(void* data)
 {
 	while (g_bRunSubmitThread.load())
@@ -955,9 +960,6 @@ GMOD_MODULE_OPEN()
 		materialsystem_loader.GetModule(), Symbols::CMatQueuedRenderContext_CallQueuedSym,
 		(void*)DETOUR_THISCALL(hook_CMatQueuedRenderContext_CallQueued, CallQueued), 0
 	);
-
-	g_bRunSubmitThread.store(true);
-	g_pSubmitThread = CreateSimpleThread((ThreadFunc_t)VRSubmitThread, nullptr);
 
 	return 0;
 }
